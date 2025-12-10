@@ -18,7 +18,7 @@
 ### 1. Клонирование репозитория
 ```bash
 git clone https://github.com/gniloeapple/Telegram-Support-Bot.git
-cd telegram-support-bot
+cd Telegram Support Bot
 ```
 ### 2. Создание виртуального окружения (рекомендуется)
 ```bash
