@@ -58,11 +58,12 @@ pip install -r requirements.txt
 
 ### 4. Настройка окружения
 
-Переименуйте файл `file.env` в `.env` (или создайте новый) и откройте его для редактирования:
+Переименуйте файл `.env.example` в `.env` (или создайте новый) и откройте его для редактирования:
 
 ```env
 TELEGRAM_TOKEN=ваш_токен_бота
 SUPPORT_CHAT_ID=-100xxxxxxxxxx
+SUPPORT_TOPIC_ID=XXX
 ```
 
 **Где взять данные:**
