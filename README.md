@@ -37,6 +37,9 @@ _Это мой первый публичный репозиторий, поэт�
 ```bash
 git clone https://github.com/gniloeapple/telegram-support-bot.git
 cd telegram-support-bot
+
+cp .env.example .env
+nano .env
 ```
 
 ### 2. Создание виртуального окружения (рекомендуется)
