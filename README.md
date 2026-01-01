@@ -9,10 +9,10 @@
 ---
 
 <p align="center">
-<img src="[https://img.shields.io/badge/Python-3.10+-blue.svg](https://img.shields.io/badge/Python-3.10+-blue.svg)">
-<img src="[https://img.shields.io/badge/Telegram%20Bot%20API-async-green.svg](https://img.shields.io/badge/Telegram%20Bot%20API-async-green.svg)">
-<img src="[https://img.shields.io/badge/License-MIT-lightgrey.svg](https://img.shields.io/badge/License-MIT-lightgrey.svg)">
-<img src="[https://img.shields.io/badge/Database-SQLite-orange.svg](https://img.shields.io/badge/Database-SQLite-orange.svg)">
+  <img src="https://img.shields.io/badge/Python-3.10+-blue.svg">
+  <img src="https://img.shields.io/badge/Telegram%20Bot%20API-async-green.svg">
+  <img src="https://img.shields.io/badge/License-MIT-lightgrey.svg">
+  <img src="https://img.shields.io/badge/Database-SQLite-orange.svg">
 </p>
 
 ---
