@@ -5,8 +5,15 @@ from datetime import datetime, timezone
 import pytz
 
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    CallbackQueryHandler,
+)
 
 load_dotenv()
 
@@ -17,6 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+
 SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID"))
 
 raw_topic_id = os.getenv("SUPPORT_TOPIC_ID")
@@ -32,10 +40,10 @@ cursor = conn.cursor()
 cursor.execute(
     """
 CREATE TABLE IF NOT EXISTS messages_mapping (
-    user_chat_id      INTEGER,
-    user_message_id   INTEGER,
+    user_chat_id       INTEGER,
+    user_message_id    INTEGER,
     support_message_id INTEGER,
-    ticket_id         INTEGER,
+    ticket_id          INTEGER,
     PRIMARY KEY(user_chat_id, user_message_id)
 )
 """
@@ -45,26 +53,69 @@ CREATE TABLE IF NOT EXISTS messages_mapping (
 cursor.execute(
     """
 CREATE TABLE IF NOT EXISTS tickets (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_chat_id  INTEGER NOT NULL,
-    username      TEXT,
-    first_name    TEXT,
-    status        TEXT NOT NULL DEFAULT 'open',
-    created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_chat_id   INTEGER NOT NULL,
+    username       TEXT,
+    first_name     TEXT,
+    status         TEXT NOT NULL DEFAULT 'open',
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
 )
 """
 )
 
+# ---- таблица заблокированных пользователей ----
+cursor.execute(
+    """
+CREATE TABLE IF NOT EXISTS blocked_users (
+    user_chat_id INTEGER PRIMARY KEY,
+    blocked_at   TEXT NOT NULL,
+    admin_id     INTEGER
+)
+"""
+)
+conn.commit()
+
+
 # ----------------- Утилиты -----------------
 def format_datetime(iso_string: str) -> str:
     """Конвертирует ISO datetime в читаемый формат МСК"""
-    dt = datetime.fromisoformat(iso_string)
-    # Если время UTC, конвертируем в МСК
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    dt_msk = dt.astimezone(MSK)
-    return dt_msk.strftime("%d.%m.%Y %H:%M")
+    try:
+        dt = datetime.fromisoformat(iso_string)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt_msk = dt.astimezone(MSK)
+        return dt_msk.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return iso_string
+
+
+# ----------------- Работа с БД / Блокировка -----------------
+
+def is_user_blocked(user_chat_id: int) -> bool:
+    """Проверяет, заблокирован ли пользователь"""
+    cursor.execute("SELECT 1 FROM blocked_users WHERE user_chat_id = ?", (user_chat_id,))
+    return cursor.fetchone() is not None
+
+
+def toggle_user_block(user_chat_id: int, admin_id: int) -> bool:
+    """
+    Блокирует или разблокирует пользователя.
+    Возвращает True, если пользователь стал ЗАБЛОКИРОВАН.
+    Возвращает False, если пользователь стал РАЗБЛОКИРОВАН.
+    """
+    if is_user_blocked(user_chat_id):
+        cursor.execute("DELETE FROM blocked_users WHERE user_chat_id = ?", (user_chat_id,))
+        conn.commit()
+        return False
+    else:
+        now = datetime.now(timezone.utc).isoformat()
+        cursor.execute(
+            "INSERT INTO blocked_users (user_chat_id, blocked_at, admin_id) VALUES (?, ?, ?)",
+            (user_chat_id, now, admin_id),
+        )
+        conn.commit()
+        return True
 
 
 # ----------------- Работа с БД / тикетами -----------------
@@ -106,7 +157,6 @@ def update_ticket_status(ticket_id: int, status: str):
         (status, now, ticket_id),
     )
     conn.commit()
-
 
 
 def get_ticket_by_support_message(support_message_id: int):
@@ -158,7 +208,8 @@ def get_all_open_tickets(limit: int = 50):
         (limit,),
     )
     return cursor.fetchall()
-    
+
+
 def get_user_chat_id_by_ticket(ticket_id: int):
     cursor.execute(
         """
@@ -170,17 +221,28 @@ def get_user_chat_id_by_ticket(ticket_id: int):
     row = cursor.fetchone()
     return row[0] if row else None
 
+
 # ----------------- Хендлеры пользователя -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Если пользователь заблокирован, не отвечаем или говорим о блоке
+    if is_user_blocked(update.effective_user.id):
+        return
+        
     await update.message.reply_text(
-        "Здравствуйте! Напишите ваше сообщение.\n\nНапишите Ваш вопрос, и мы ответим Вам в ближайшее время.\n\n🕘 Время работы поддержки: Пн - Вс, с 7:00 до 21:00 по МСК"
+        "Здравствуйте! Напишите ваше сообщение.\n\n"
+        "Напишите Ваш вопрос, и мы ответим Вам в ближайшее время.\n\n"
+        "🕘 Время работы поддержки: Пн - Вс, с 7:00 до 21:00 по МСК"
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_user_blocked(update.effective_user.id):
+        return
+
     help_text = (
         "🕘 Время работы поддержки: Пн - Вс, с 7:00 до 21:00 по МСК\n\n"
-        "📝 Заполняйте тикет внимательно и кратко, но максимально подробно. Помните, что это не чат с техподдержкой в реальном времени. Все тикеты обрабатываются в порядке очереди.\n\n"
+        "📝 Заполняйте тикет внимательно и кратко, но максимально подробно. "
+        "Помните, что это не чат с техподдержкой в реальном времени. Все тикеты обрабатываются в порядке очереди.\n\n"
         "⌛️ Возможно придётся подождать некоторое время, прежде чем вы получите ответ на свой вопрос."
     )
     await update.message.reply_text(help_text)
@@ -191,6 +253,11 @@ async def forward_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = message.from_user
     user_chat_id = message.chat_id
     user_message_id = message.message_id
+
+    if is_user_blocked(user_chat_id):
+        # Опционально: можно уведомить пользователя, что он в ЧС
+        # await message.reply_text("⛔️ Вы заблокированы и не можете писать в поддержку.")
+        return
 
     # ищем открытый тикет или создаём новый
     ticket_id = get_open_ticket(user_chat_id)
@@ -227,6 +294,13 @@ async def forward_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
     send_kwargs = {"chat_id": SUPPORT_CHAT_ID}
     if SUPPORT_TOPIC_ID:
         send_kwargs["message_thread_id"] = SUPPORT_TOPIC_ID
+
+    # Callback data формат: "block_{user_id}"
+    keyboard = [
+        [InlineKeyboardButton("❌ Заблокировать/Разблокировать", callback_data=f"block_{user_chat_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    send_kwargs["reply_markup"] = reply_markup
 
     sent_message = None
 
@@ -288,6 +362,7 @@ async def forward_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         logger.error(f"Ошибка при пересылке сообщения: {e}")
 
+
 # ----------------- Хендлеры поддержки -----------------
 async def reply_from_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -305,6 +380,11 @@ async def reply_from_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     user_chat_id, user_message_id, ticket_id = found
+    
+    # Можно добавить проверку: если юзер заблокирован, не отправлять ему ответ
+    if is_user_blocked(user_chat_id):
+        await message.reply_text("⛔️ Этот пользователь заблокирован. Он не получит сообщение.")
+        return
 
     try:
         if message.photo:
@@ -349,6 +429,50 @@ async def reply_from_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     except Exception as e:
         logger.error(f"Ошибка при отправке ответа пользователю: {e}")
+
+
+# ----------------- Обработка кнопок -----------------
+async def block_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()  # Убираем часики загрузки
+
+    data = query.data
+    # data имеет вид block_123456789
+    if not data.startswith("block_"):
+        return
+    
+    try:
+        target_user_id = int(data.split("_")[1])
+    except (IndexError, ValueError):
+        return
+    
+    admin_id = query.from_user.id
+    
+    # Переключаем статус блокировки
+    is_blocked_now = toggle_user_block(target_user_id, admin_id)
+    
+    # Получаем информацию о пользователе из БД тикетов (для красоты лога)
+    # Берем последний тикет этого юзера
+    cursor.execute("SELECT username, first_name FROM tickets WHERE user_chat_id = ? ORDER BY id DESC LIMIT 1", (target_user_id,))
+    res = cursor.fetchone()
+    if res:
+        username, first_name = res
+        username_str = f"@{username}" if username else "без юзернейма"
+        user_info = f"{first_name or 'Пользователь'} ({username_str})"
+    else:
+        user_info = f"Пользователь {target_user_id}"
+
+    # Отправляем сообщение в чат поддержки, как на скрине
+    if is_blocked_now:
+        text = f"👨 {user_info} 🆔 Идентификатор: {target_user_id}\n❗️ Пользователь был успешно заблокирован"
+    else:
+        text = f"👨 {user_info} 🆔 Идентификатор: {target_user_id}\n❗️ Пользователь был успешно разблокирован"
+
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        message_thread_id=query.message.message_thread_id,
+        text=text
+    )
 
 
 # --------- Команды для операторов в чате поддержки ---------
@@ -466,11 +590,15 @@ async def ticket_info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_chat_id, status, created_at, updated_at = row
     created_fmt = format_datetime(created_at)
     updated_fmt = format_datetime(updated_at)
+    
+    is_blocked = is_user_blocked(user_chat_id)
+    block_status = "ДА ⛔️" if is_blocked else "НЕТ ✅"
 
     text = (
         f"📄 Тикет #{ticket_id}\n"
         f"Пользователь: {user_chat_id}\n"
-        f"Статус: {status}\n"
+        f"Статус тикета: {status}\n"
+        f"Заблокирован: {block_status}\n"
         f"Создан: {created_fmt}\n"
         f"Обновлён: {updated_fmt}"
     )
@@ -492,6 +620,10 @@ def main():
     application.add_handler(CommandHandler("reopen", reopen_ticket_cmd))
     application.add_handler(CommandHandler("ticket", ticket_info_cmd))
     application.add_handler(CommandHandler("open_tickets", open_tickets_cmd))
+
+    # Обработчик нажатия на кнопку (Block/Unblock)
+    # Pattern ^block_ ловит все callback_data, начинающиеся с block_
+    application.add_handler(CallbackQueryHandler(block_user_callback, pattern="^block_"))
 
     application.add_handler(
         MessageHandler(
