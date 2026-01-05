@@ -13,6 +13,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
     CallbackQueryHandler,
+    ConversationHandler,
 )
 
 load_dotenv()
@@ -24,14 +25,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-
 SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID"))
 
 raw_topic_id = os.getenv("SUPPORT_TOPIC_ID")
 SUPPORT_TOPIC_ID = int(raw_topic_id) if raw_topic_id and raw_topic_id.strip().isdigit() else None
 
+# Список админов из .env (через запятую)
+ADMINS = [int(admin_id.strip()) for admin_id in os.getenv("ADMINS", "").split(",") if admin_id.strip()]
+
 # Временная зона МСК
 MSK = pytz.timezone('Europe/Moscow')
+
+# Состояния для ConversationHandler
+WAITING_GREETING, WAITING_HELP = range(2)
 
 conn = sqlite3.connect("support_bot.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -74,7 +80,50 @@ CREATE TABLE IF NOT EXISTS blocked_users (
 )
 """
 )
+
+# ---- таблица настроек бота ----
+cursor.execute(
+    """
+CREATE TABLE IF NOT EXISTS bot_settings (
+    setting_key   TEXT PRIMARY KEY,
+    setting_value TEXT NOT NULL
+)
+"""
+)
+
 conn.commit()
+
+
+# ----------------- Утилиты настроек -----------------
+def get_setting(key: str, default: str = "") -> str:
+    """Получает значение настройки из БД"""
+    cursor.execute("SELECT setting_value FROM bot_settings WHERE setting_key = ?", (key,))
+    row = cursor.fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key: str, value: str):
+    """Сохраняет значение настройки в БД"""
+    cursor.execute(
+        "INSERT OR REPLACE INTO bot_settings (setting_key, setting_value) VALUES (?, ?)",
+        (key, value),
+    )
+    conn.commit()
+
+
+# Дефолтные тексты
+DEFAULT_GREETING = (
+    "Здравствуйте!\n\n"
+    "Напишите Ваш вопрос, и мы ответим Вам в ближайшее время.\n\n"
+    "🕘 Время работы поддержки: Пн - Вс, с 7:00 до 21:00 по МСК"
+)
+
+DEFAULT_HELP = (
+    "🕘 Время работы поддержки: Пн - Вс, с 7:00 до 21:00 по МСК\n\n"
+    "📝 Заполняйте тикет внимательно и кратко, но максимально подробно. "
+    "Помните, что это не чат с техподдержкой в реальном времени. Все тикеты обрабатываются в порядке очереди.\n\n"
+    "⌛️ Возможно придётся подождать некоторое время, прежде чем вы получите ответ на свой вопрос."
+)
 
 
 # ----------------- Утилиты -----------------
@@ -88,6 +137,11 @@ def format_datetime(iso_string: str) -> str:
         return dt_msk.strftime("%d.%m.%Y %H:%M")
     except Exception:
         return iso_string
+
+
+def is_admin(user_id: int) -> bool:
+    """Проверяет, является ли пользователь админом"""
+    return user_id in ADMINS
 
 
 # ----------------- Работа с БД / Блокировка -----------------
@@ -222,27 +276,18 @@ def get_user_chat_id_by_ticket(ticket_id: int):
 
 # ----------------- Хендлеры пользователя -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Если пользователь заблокирован, не отвечаем или говорим о блоке
     if is_user_blocked(update.effective_user.id):
         return
-        
-    await update.message.reply_text(
-        "Здравствуйте!\n\n"
-        "Напишите Ваш вопрос, и мы ответим Вам в ближайшее время.\n\n"
-        "🕘 Время работы поддержки: Пн - Вс, с 7:00 до 21:00 по МСК"
-    )
+    
+    greeting_text = get_setting("greeting", DEFAULT_GREETING)
+    await update.message.reply_text(greeting_text)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_user_blocked(update.effective_user.id):
         return
 
-    help_text = (
-        "🕘 Время работы поддержки: Пн - Вс, с 7:00 до 21:00 по МСК\n\n"
-        "📝 Заполняйте тикет внимательно и кратко, но максимально подробно. "
-        "Помните, что это не чат с техподдержкой в реальном времени. Все тикеты обрабатываются в порядке очереди.\n\n"
-        "⌛️ Возможно придётся подождать некоторое время, прежде чем вы получите ответ на свой вопрос."
-    )
+    help_text = get_setting("help", DEFAULT_HELP)
     await update.message.reply_text(help_text)
 
 
@@ -253,21 +298,16 @@ async def forward_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_message_id = message.message_id
 
     if is_user_blocked(user_chat_id):
-        # Опционально: можно уведомить пользователя, что он в ЧС
-        # await message.reply_text("⛔️ Вы заблокированы и не можете писать в поддержку.")
         return
 
-    # ищем открытый тикет или создаём новый
     ticket_id = get_open_ticket(user_chat_id)
     new_ticket = False
     if ticket_id is None:
         ticket_id = create_ticket(user_chat_id, user.username, user.first_name)
         new_ticket = True
 
-    # Формируем username с @ или "Не указан"
     username = f"@{user.username}" if user.username else "Не указан"
     
-    # Формируем красивый заголовок
     if new_ticket:
         header = (
             f"🎫 НОВЫЙ ТИКЕТ\n\n"
@@ -277,13 +317,11 @@ async def forward_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"📱 Username: {username}"
         )
     else:
-        # Для дополнительных сообщений в уже открытом тикете
         header = (
             f"💬 Тикет #{ticket_id}\n"
             f"👤 {user.first_name or 'Не указано'} ({username}):"
         )
 
-    # если новый тикет — уведомляем пользователя
     if new_ticket:
         await message.reply_text(
             f"✅ Ваш тикет #{ticket_id} создан. Оператор поддержки скоро ответит."
@@ -293,7 +331,6 @@ async def forward_to_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if SUPPORT_TOPIC_ID:
         send_kwargs["message_thread_id"] = SUPPORT_TOPIC_ID
 
-    # Callback data формат: "block_{user_id}"
     keyboard = [
         [InlineKeyboardButton("❌ Заблокировать/Разблокировать", callback_data=f"block_{user_chat_id}")]
     ]
@@ -379,7 +416,6 @@ async def reply_from_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     user_chat_id, user_message_id, ticket_id = found
     
-    # Можно добавить проверку: если юзер заблокирован, не отправлять ему ответ
     if is_user_blocked(user_chat_id):
         await message.reply_text("⛔️ Этот пользователь заблокирован. Он не получит сообщение.")
         return
@@ -429,13 +465,223 @@ async def reply_from_support(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.error(f"Ошибка при отправке ответа пользователю: {e}")
 
 
+# ----------------- Админ-панель -----------------
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /admin - показывает админ-панель"""
+    user_id = update.effective_user.id
+    
+    if not is_admin(user_id):
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("✏️ Изменить приветствие", callback_data="admin_edit_greeting")],
+        [InlineKeyboardButton("📝 Изменить информацию", callback_data="admin_edit_help")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    msg = await update.message.reply_text(
+        "⚙️ Управление ботом",
+        reply_markup=reply_markup
+    )
+    # Сохраняем ID сообщения с админ-панелью
+    context.user_data['admin_menu_message_id'] = msg.message_id
+    context.user_data['admin_menu_chat_id'] = msg.chat_id
+
+
+async def show_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает админ-панель и завершает conversation"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        return ConversationHandler.END
+    
+    keyboard = [
+        [InlineKeyboardButton("✏️ Изменить приветствие", callback_data="admin_edit_greeting")],
+        [InlineKeyboardButton("📝 Изменить информацию", callback_data="admin_edit_help")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Редактируем исходное сообщение с админ-панелью
+    menu_msg_id = context.user_data.get('admin_menu_message_id')
+    menu_chat_id = context.user_data.get('admin_menu_chat_id')
+    
+    if menu_msg_id and menu_chat_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=menu_chat_id,
+                message_id=menu_msg_id,
+                text="⚙️ Управление ботом",
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            if "message is not modified" not in str(e).lower():
+                logger.error(f"Ошибка редактирования меню: {e}")
+    
+    # Удаляем сообщение с кнопкой "В меню"
+    back_button_msg_id = context.user_data.get('back_button_message_id')
+    if back_button_msg_id and menu_chat_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=menu_chat_id,
+                message_id=back_button_msg_id
+            )
+        except Exception as e:
+            logger.error(f"Ошибка удаления кнопки: {e}")
+    
+    return ConversationHandler.END
+
+
+async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на кнопки в админ-панели"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        return
+    
+    # Сохраняем ID сообщения с кнопками админ-панели
+    context.user_data['admin_menu_message_id'] = query.message.message_id
+    context.user_data['admin_menu_chat_id'] = query.message.chat_id
+    
+    # Кнопка для возврата в меню
+    back_keyboard = [
+        [InlineKeyboardButton("◀️ В меню", callback_data="admin_back_to_menu")]
+    ]
+    back_markup = InlineKeyboardMarkup(back_keyboard)
+    
+    if query.data == "admin_edit_greeting":
+        current_text = get_setting("greeting", DEFAULT_GREETING)
+        msg = await query.message.reply_text(
+            f"👉 Введите новое сообщение приветствия:\n\n"
+            f"<b>Текущее приветствие:</b>\n{current_text}",
+            parse_mode="HTML",
+            reply_markup=back_markup
+        )
+        # Сохраняем ID сообщения с кнопкой "В меню"
+        context.user_data['back_button_message_id'] = msg.message_id
+        return WAITING_GREETING
+    
+    elif query.data == "admin_edit_help":
+        current_text = get_setting("help", DEFAULT_HELP)
+        msg = await query.message.reply_text(
+            f"👉 Введите новое сообщение помощи:\n\n"
+            f"<b>Текущая информация:</b>\n{current_text}",
+            parse_mode="HTML",
+            reply_markup=back_markup
+        )
+        # Сохраняем ID сообщения с кнопкой "В меню"
+        context.user_data['back_button_message_id'] = msg.message_id
+        return WAITING_HELP
+
+
+async def save_greeting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохраняет новое приветственное сообщение"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return ConversationHandler.END
+    
+    new_text = update.message.text
+    set_setting("greeting", new_text)
+    
+    await update.message.reply_text("✅ Приветственное сообщение успешно обновлено!")
+    
+    # Показываем обновленное меню, редактируя исходное сообщение
+    keyboard = [
+        [InlineKeyboardButton("✏️ Изменить приветствие", callback_data="admin_edit_greeting")],
+        [InlineKeyboardButton("📝 Изменить информацию", callback_data="admin_edit_help")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    menu_msg_id = context.user_data.get('admin_menu_message_id')
+    menu_chat_id = context.user_data.get('admin_menu_chat_id')
+    
+    if menu_msg_id and menu_chat_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=menu_chat_id,
+                message_id=menu_msg_id,
+                text="⚙️ Управление ботом",
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            if "message is not modified" not in str(e).lower():
+                logger.error(f"Ошибка редактирования меню: {e}")
+    
+    # Удаляем сообщение с кнопкой "В меню"
+    back_button_msg_id = context.user_data.get('back_button_message_id')
+    if back_button_msg_id and menu_chat_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=menu_chat_id,
+                message_id=back_button_msg_id
+            )
+        except Exception as e:
+            logger.error(f"Ошибка удаления кнопки: {e}")
+    
+    return ConversationHandler.END
+
+
+async def save_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохраняет новое сообщение помощи"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return ConversationHandler.END
+    
+    new_text = update.message.text
+    set_setting("help", new_text)
+    
+    await update.message.reply_text("✅ Сообщение помощи успешно обновлено!")
+    
+    # Показываем обновленное меню, редактируя исходное сообщение
+    keyboard = [
+        [InlineKeyboardButton("✏️ Изменить приветствие", callback_data="admin_edit_greeting")],
+        [InlineKeyboardButton("📝 Изменить информацию", callback_data="admin_edit_help")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    menu_msg_id = context.user_data.get('admin_menu_message_id')
+    menu_chat_id = context.user_data.get('admin_menu_chat_id')
+    
+    if menu_msg_id and menu_chat_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=menu_chat_id,
+                message_id=menu_msg_id,
+                text="⚙️ Управление ботом",
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            if "message is not modified" not in str(e).lower():
+                logger.error(f"Ошибка редактирования меню: {e}")
+    
+    # Удаляем сообщение с кнопкой "В меню"
+    back_button_msg_id = context.user_data.get('back_button_message_id')
+    if back_button_msg_id and menu_chat_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=menu_chat_id,
+                message_id=back_button_msg_id
+            )
+        except Exception as e:
+            logger.error(f"Ошибка удаления кнопки: {e}")
+    
+    return ConversationHandler.END
+
+
+async def cancel_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена операции редактирования"""
+    await update.message.reply_text("❌ Операция отменена.")
+    return ConversationHandler.END
+
 # ----------------- Обработка кнопок -----------------
 async def block_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()  # Убираем часики загрузки
+    await query.answer()
 
     data = query.data
-    # data имеет вид block_123456789
     if not data.startswith("block_"):
         return
     
@@ -446,11 +692,8 @@ async def block_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     admin_id = query.from_user.id
     
-    # Переключаем статус блокировки
     is_blocked_now = toggle_user_block(target_user_id, admin_id)
     
-    # Получаем информацию о пользователе из БД тикетов (для красоты лога)
-    # Берем последний тикет этого юзера
     cursor.execute("SELECT username, first_name FROM tickets WHERE user_chat_id = ? ORDER BY id DESC LIMIT 1", (target_user_id,))
     res = cursor.fetchone()
     if res:
@@ -460,7 +703,6 @@ async def block_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         user_info = f"Пользователь {target_user_id}"
 
-    # Отправляем сообщение в чат поддержки, как на скрине
     if is_blocked_now:
         text = f"👨 {user_info}\n❗️ Пользователь заблокирован"
     else:
@@ -472,12 +714,10 @@ async def block_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         text=text
     )
 
-
 # --------- Команды для операторов в чате поддержки ---------
 async def open_tickets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
 
-    # Команда только из чата поддержки
     if message.chat_id != SUPPORT_CHAT_ID:
         return
     if SUPPORT_TOPIC_ID and message.message_thread_id != SUPPORT_TOPIC_ID:
@@ -521,13 +761,11 @@ async def close_ticket_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Не удалось определить тикет для этого сообщения.")
         return
 
-    # Получаем user_chat_id для уведомления
     user_chat_id = get_user_chat_id_by_ticket(ticket_id)
     
     update_ticket_status(ticket_id, "closed")
     await message.reply_text(f"✅ Тикет #{ticket_id} закрыт.")
     
-    # Уведомляем пользователя
     if user_chat_id:
         try:
             await context.bot.send_message(
@@ -610,8 +848,30 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     application = Application.builder().token(TOKEN).build()
 
+    # ConversationHandler для админ-панели
+    admin_conv_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(admin_callback_handler, pattern="^admin_edit_")
+        ],
+        states={
+            WAITING_GREETING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, save_greeting),
+                CallbackQueryHandler(show_admin_menu, pattern="^admin_back_to_menu$")
+            ],
+            WAITING_HELP: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, save_help),
+                CallbackQueryHandler(show_admin_menu, pattern="^admin_back_to_menu$")
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_admin),
+            CallbackQueryHandler(show_admin_menu, pattern="^admin_back_to_menu$")
+        ],
+    )
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("admin", admin_command))
 
     # команды для операторов
     application.add_handler(CommandHandler("close", close_ticket_cmd))
@@ -619,8 +879,10 @@ def main():
     application.add_handler(CommandHandler("ticket", ticket_info_cmd))
     application.add_handler(CommandHandler("open_tickets", open_tickets_cmd))
 
-    # Обработчик нажатия на кнопку (Block/Unblock)
-    # Pattern ^block_ ловит все callback_data, начинающиеся с block_
+    # Conversation handler для админки
+    application.add_handler(admin_conv_handler)
+
+    # Обработчик нажатия на кнопку Block/Unblock
     application.add_handler(CallbackQueryHandler(block_user_callback, pattern="^block_"))
 
     application.add_handler(
