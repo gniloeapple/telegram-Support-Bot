@@ -24,6 +24,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID"))
 
